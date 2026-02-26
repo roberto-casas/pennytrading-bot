@@ -1,0 +1,40 @@
+# Penny Trading Bot – Default Configuration
+
+bot:
+  dry_run: true                  # Set to false for live trading
+  log_level: INFO
+  db_path: pennytrading.db
+  poll_interval_seconds: 5       # Dashboard refresh / position-check interval
+
+markets:
+  assets: [BTC, ETH]
+  resolutions: [5, 15]           # Minutes – focus on 5-min and 15-min markets
+  max_markets_per_asset: 3       # How many simultaneous markets to watch per asset
+
+strategy:
+  min_edge: 0.04                 # Minimum edge (4 %) before entering a trade
+  min_liquidity_usdc: 500        # Minimum USDC liquidity on best side required
+  max_spread_pct: 0.08           # Maximum acceptable bid-ask spread (8 %)
+  prefer_limit_orders: true      # Use limit orders when possible
+  price_min: 0.02                # Do not trade YES/NO contracts below this price
+  price_max: 0.98                # Do not trade YES/NO contracts above this price
+
+kelly:
+  fraction: 0.25                 # Fractional Kelly (0.25 = quarter Kelly)
+  max_position_pct: 0.10         # Cap any single position at 10 % of bankroll
+  min_bet_usdc: 5.0              # Minimum bet in USDC
+  max_bet_usdc: 500.0            # Hard cap per position in USDC
+
+risk:
+  stop_loss_pct: 0.50            # Exit position if price drops 50 % from entry
+  take_profit_pct: 2.00          # Exit position if price rises 200 % from entry
+  max_open_positions: 10         # Limit concurrent open positions
+  time_limit_fraction: 0.75      # Close position if > 75 % of time-to-resolution elapsed
+
+clob:
+  rest_url: https://clob.polymarket.com
+  ws_url: wss://ws-subscriptions-clob.polymarket.com/ws/
+  gamma_url: https://gamma-api.polymarket.com
+
+dashboard:
+  refresh_rate: 1.0              # Seconds between live dashboard refreshes
