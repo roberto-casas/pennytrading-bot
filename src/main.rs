@@ -16,6 +16,7 @@ use chrono::Utc;
 use clap::Parser;
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -72,9 +73,9 @@ async fn main() -> Result<()> {
         .init();
 
     if settings.bot.dry_run {
-        info!("🟡 DRY RUN mode – no real orders will be placed.");
+        info!("DRY RUN mode – no real orders will be placed.");
     } else if !settings.has_credentials() {
-        warn!("⚠️  No API credentials found – forcing dry-run mode.");
+        warn!("No API credentials found – forcing dry-run mode.");
     }
 
     info!(
@@ -168,12 +169,12 @@ async fn main() -> Result<()> {
         st.add_log("WebSocket connection started".to_string());
     }
 
-    // Build strategy and trader
-    let strategy = Strategy::new(
+    // Build strategy and trader (wrapped for mutation during cycles)
+    let strategy = Arc::new(RwLock::new(Strategy::new(
         settings.strategy.clone(),
         settings.kelly.clone(),
         settings.risk.clone(),
-    );
+    )));
     let trader = Trader::new(
         settings.risk.clone(),
         settings.strategy.clone(),
@@ -183,6 +184,10 @@ async fn main() -> Result<()> {
     // Poll interval
     let poll_ms = (settings.bot.poll_interval_seconds * 1000.0) as u64;
     let mut poll_ticker = tokio::time::interval(std::time::Duration::from_millis(poll_ms));
+
+    // Balance refresh counter (refresh every N cycles to avoid API spam)
+    let mut cycle_count: u64 = 0;
+    const BALANCE_REFRESH_CYCLES: u64 = 12; // every ~60s at 5s poll
 
     // Dashboard setup (unless --no-dashboard)
     let mut terminal = if !cli.no_dashboard {
@@ -203,10 +208,12 @@ async fn main() -> Result<()> {
     // Main event loop
     // -----------------------------------------------------------------------
     loop {
-        // Render dashboard
+        // Render dashboard (read lock only, no clone of entire state)
         if let Some(ref mut term) = terminal {
-            let st = state.read().unwrap().clone();
-            term.draw(|f| dashboard::render(f, &st))?;
+            let st = state.read().unwrap();
+            let st_ref = &*st;
+            term.draw(|f| dashboard::render(f, st_ref))?;
+            drop(st);
         }
 
         tokio::select! {
@@ -231,6 +238,17 @@ async fn main() -> Result<()> {
 
             // ── Strategy + position-management poll tick ───────────────────
             _ = poll_ticker.tick() => {
+                cycle_count += 1;
+
+                // Periodically refresh balance from API
+                if cycle_count % BALANCE_REFRESH_CYCLES == 0 {
+                    let fresh_balance = client.get_balance().await;
+                    if fresh_balance > 0.0 {
+                        let mut st = state.write().unwrap();
+                        st.balance_usdc = fresh_balance;
+                    }
+                }
+
                 if let Err(e) = run_cycle(
                     &state,
                     &client,
@@ -288,7 +306,7 @@ async fn run_cycle(
     client: &Arc<PolymarketClient>,
     db: &Arc<Database>,
     session_id: &str,
-    strategy: &Strategy,
+    strategy: &Arc<RwLock<Strategy>>,
     trader: &Trader,
     markets: &[models::Market],
 ) -> Result<()> {
@@ -302,7 +320,23 @@ async fn run_cycle(
         )
     };
 
-    // ── 1. Monitor existing positions (SL / TP / time-limit) ──────────────
+    // ── 0. Update strategy spot prices from order book data ───────────────
+    {
+        let mut strat = strategy.write().unwrap();
+        strat.update_spots_from_books(markets, &order_books);
+
+        // Record mid-prices for adaptive volatility
+        let now = Utc::now().timestamp() as f64;
+        for market in markets {
+            if let Some(book) = order_books.get(&market.yes_token_id) {
+                if let Some(mid) = book.mid_price() {
+                    strat.record_price(&market.yes_token_id, now, mid);
+                }
+            }
+        }
+    }
+
+    // ── 1. Monitor existing positions (SL / TP / trailing-stop / time-limit)
     let closed = trader
         .monitor_positions(
             &mut open_positions,
@@ -315,7 +349,6 @@ async fn run_cycle(
         .await?;
 
     // ── 2. Check market resolution ─────────────────────────────────────────
-    // Re-fetch market states from DB to detect newly resolved markets
     let db_markets = db.get_all_markets().unwrap_or_default();
     let resolved = trader.check_resolution(&mut open_positions, &db_markets, db, session_id)?;
 
@@ -326,44 +359,63 @@ async fn run_cycle(
         .filter(|p| p.status.is_open())
         .collect();
 
+    // Build per-asset position count for concentration limit
+    let mut asset_position_counts: HashMap<String, usize> = HashMap::new();
+    for p in &still_open {
+        *asset_position_counts.entry(p.asset.clone()).or_insert(0) += 1;
+    }
+
+    // Deduct cost of open positions from available bankroll for Kelly sizing
+    let open_cost: f64 = still_open.iter().map(|p| p.cost_usdc).sum();
+    let available_bankroll = (balance_usdc - open_cost).max(0.0);
+
+    let strat = strategy.read().unwrap();
+
     for market in markets {
         // Skip if we already hold a position in this market
         if still_open.iter().any(|p| p.market_id == market.condition_id) {
             continue;
         }
 
-        // Try YES token book first, then NO
-        for token_id in [&market.yes_token_id, &market.no_token_id] {
-            if let Some(book) = order_books.get(token_id.as_str()) {
-                if let Some(signal) = strategy.evaluate(
-                    market,
-                    book,
-                    balance_usdc,
-                    still_open.len() + new_positions.len(),
-                ) {
-                    match trader.open_position(&signal, client, db, session_id).await {
-                        Ok(pos) => {
-                            {
-                                let mut st = state.write().unwrap();
-                                st.add_log(format!(
-                                    "Opened {} {} {:.4} edge={:.2}% bet=${:.2}",
-                                    signal.market.label(),
-                                    signal.side,
-                                    signal.entry_price,
-                                    signal.kelly.edge * 100.0,
-                                    signal.bet_usdc,
-                                ));
-                                st.trades_opened += 1;
-                            }
-                            new_positions.push(pos);
-                        }
-                        Err(e) => {
+        // FIX: Only use the YES token's order book for strategy evaluation.
+        // The strategy derives NO prices internally as (1 - YES_bid).
+        // Passing the NO book would produce wrong prices for both sides.
+        if let Some(book) = order_books.get(market.yes_token_id.as_str()) {
+            if let Some(signal) = strat.evaluate(
+                market,
+                book,
+                available_bankroll,
+                still_open.len() + new_positions.len(),
+                &asset_position_counts,
+            ) {
+                drop(strat); // release read lock before async operation
+                match trader.open_position(&signal, client, db, session_id).await {
+                    Ok(pos) => {
+                        {
                             let mut st = state.write().unwrap();
-                            st.add_log(format!("ERROR opening position: {e}"));
+                            st.add_log(format!(
+                                "Opened {} {} {:.4} edge={:.2}% bet=${:.2}",
+                                signal.market.label(),
+                                signal.side,
+                                signal.entry_price,
+                                signal.kelly.edge * 100.0,
+                                signal.bet_usdc,
+                            ));
+                            st.trades_opened += 1;
                         }
+                        // Update asset count
+                        *asset_position_counts.entry(signal.market.asset.clone()).or_insert(0) += 1;
+                        new_positions.push(pos);
                     }
-                    break; // Only one signal per market per cycle
+                    Err(e) => {
+                        let mut st = state.write().unwrap();
+                        st.add_log(format!("ERROR opening position: {e}"));
+                    }
                 }
+                // Re-acquire strategy read lock for next iteration
+                // We need to break here and let the next cycle handle further markets
+                // because we can't re-borrow `strat` after dropping it.
+                break;
             }
         }
     }
@@ -398,9 +450,11 @@ async fn run_cycle(
         // Recalculate total P&L from DB
         st.total_pnl = db.total_pnl().unwrap_or(0.0);
 
-        // Snapshot order_books from the client's shared cache
+        // Merge fresh order_books from the client's shared WS cache
         if let Ok(books) = client.order_books.read() {
-            st.order_books = books.clone();
+            for (token_id, book) in books.iter() {
+                st.order_books.insert(token_id.clone(), book.clone());
+            }
         }
     }
 

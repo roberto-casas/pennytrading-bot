@@ -244,8 +244,13 @@ impl PolymarketClient {
                 )
                 .await
                 {
-                    Ok(()) => {
-                        info!("WebSocket closed gracefully.");
+                    Ok(true) => {
+                        // Connection was alive and received data; reset backoff
+                        info!("WebSocket disconnected after receiving data – reconnecting");
+                        backoff = 1;
+                    }
+                    Ok(false) => {
+                        info!("WebSocket closed gracefully with no data.");
                         break;
                     }
                     Err(e) => {
@@ -376,6 +381,9 @@ impl PolymarketClient {
 // WebSocket internals
 // ---------------------------------------------------------------------------
 
+/// Returns `Ok(true)` if at least one message was successfully received
+/// (so caller can reset backoff), `Ok(false)` for graceful close with
+/// no messages, and `Err` for connection failures.
 async fn ws_run(
     ws_url: &str,
     markets: &[Market],
@@ -384,7 +392,7 @@ async fn ws_run(
     api_passphrase: &str,
     tx: &mpsc::Sender<BookUpdate>,
     order_books: &Arc<RwLock<HashMap<String, OrderBook>>>,
-) -> Result<()> {
+) -> Result<bool> {
     info!("Connecting to WebSocket: {ws_url}");
 
     let (mut ws, _) = connect_async(ws_url).await.context("WebSocket connect")?;
@@ -412,10 +420,12 @@ async fn ws_run(
     ws.send(Message::Text(sub.to_string())).await?;
     info!("Subscribed to {} token order books", all_token_ids.len());
 
+    let mut received_any = false;
     while let Some(msg) = ws.next().await {
         let msg = msg.context("WebSocket read error")?;
         match msg {
             Message::Text(text) => {
+                received_any = true;
                 handle_ws_text(&text, &token_to_market, tx, order_books);
             }
             Message::Ping(data) => {
@@ -425,7 +435,7 @@ async fn ws_run(
             _ => {}
         }
     }
-    Ok(())
+    Ok(received_any)
 }
 
 fn handle_ws_text(

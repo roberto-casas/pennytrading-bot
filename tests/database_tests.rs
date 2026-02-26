@@ -62,6 +62,7 @@ fn sample_position(market_id: &str) -> Position {
         cost_usdc: 35.0,
         stop_loss_price: 0.175,
         take_profit_price: 0.70,
+        high_water_mark: 0.35,
         status: TradeStatus::Open,
         exit_price: None,
         pnl_usdc: None,

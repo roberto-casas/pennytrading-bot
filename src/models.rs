@@ -256,6 +256,8 @@ pub struct Position {
     pub cost_usdc: f64,
     pub stop_loss_price: f64,
     pub take_profit_price: f64,
+    /// Highest price observed since entry (for trailing stop).
+    pub high_water_mark: f64,
     pub status: TradeStatus,
     pub exit_price: Option<f64>,
     pub pnl_usdc: Option<f64>,
@@ -276,6 +278,24 @@ impl Position {
 
     pub fn should_take_profit(&self, current_price: f64) -> bool {
         current_price >= self.take_profit_price
+    }
+
+    /// Update the high-water mark and return the trailing stop price.
+    /// Trailing stop activates once position is profitable (price > entry).
+    /// Trail distance = `trail_pct` of the high-water mark.
+    pub fn update_trailing_stop(&mut self, current_price: f64, trail_pct: f64) -> Option<f64> {
+        if current_price > self.high_water_mark {
+            self.high_water_mark = current_price;
+        }
+        // Only activate trailing stop once we're in profit
+        if self.high_water_mark > self.entry_price {
+            let trail_price = self.high_water_mark * (1.0 - trail_pct);
+            // Trailing stop must be above entry to lock in profit
+            if trail_price > self.entry_price {
+                return Some(trail_price);
+            }
+        }
+        None
     }
 }
 
