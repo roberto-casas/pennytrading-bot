@@ -2,15 +2,17 @@
 ///
 /// For each active market the strategy:
 ///   1. Checks the order book (liquidity, spread).
-///   2. Estimates fair value using a log-normal model.
-///   3. Computes Kelly bet size based on the edge.
-///   4. Enforces price and time limits (dynamically adjusted).
-///   5. Returns a `Signal` if all conditions are met.
+///   2. Estimates fair value using a log-normal model with adaptive volatility.
+///   3. Incorporates order-book imbalance as a directional signal.
+///   4. Computes Kelly bet size (spread-adjusted) based on the edge.
+///   5. Enforces price, time, and per-asset concentration limits.
+///   6. Returns a `Signal` if all conditions are met.
 use crate::{
     config::{KellyConfig, RiskConfig, StrategyConfig},
     kelly::{compute_bet, model_probability, BetResult},
     models::{Market, OrderBook, Side},
 };
+use std::collections::HashMap;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -81,21 +83,46 @@ pub fn effective_price_min(base_min: f64, time_elapsed_fraction: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Order book imbalance
+// ---------------------------------------------------------------------------
+
+/// Compute order-book imbalance ratio in [-1, 1].
+/// Positive = more bid pressure (bullish for YES), negative = more ask pressure.
+pub fn book_imbalance(book: &OrderBook, depth: f64) -> f64 {
+    let bid_liq = book.bid_liquidity(depth);
+    let ask_liq = book.ask_liquidity(depth);
+    let total = bid_liq + ask_liq;
+    if total < 1.0 {
+        return 0.0;
+    }
+    (bid_liq - ask_liq) / total
+}
+
+// ---------------------------------------------------------------------------
 // Strategy
 // ---------------------------------------------------------------------------
+
+/// Maximum per-asset open positions to avoid correlated exposure.
+const MAX_POSITIONS_PER_ASSET: usize = 3;
+
+/// Weight of order-book imbalance signal (additive to model probability).
+const IMBALANCE_WEIGHT: f64 = 0.02;
 
 pub struct Strategy {
     pub cfg: StrategyConfig,
     pub kelly_cfg: KellyConfig,
     pub risk_cfg: RiskConfig,
-    /// Current BTC spot price (updated externally, e.g. from a price feed).
+    /// Current BTC spot price (updated from order book mid-prices or external feed).
     pub btc_spot: f64,
     /// Current ETH spot price.
     pub eth_spot: f64,
-    /// Annualised volatility for BTC.
+    /// Annualised volatility for BTC (adaptive: updated from recent price data).
     pub btc_sigma: f64,
-    /// Annualised volatility for ETH.
+    /// Annualised volatility for ETH (adaptive).
     pub eth_sigma: f64,
+    /// Rolling mid-price history per token for realized volatility estimation.
+    /// token_id -> Vec<(timestamp_secs, mid_price)>
+    price_history: HashMap<String, Vec<(f64, f64)>>,
 }
 
 impl Strategy {
@@ -106,19 +133,131 @@ impl Strategy {
             risk_cfg,
             btc_spot: 0.0,
             eth_spot: 0.0,
-            btc_sigma: 0.80, // 80 % annualised – conservative for 5/15-min horizon
+            btc_sigma: 0.80,
             eth_sigma: 0.90,
+            price_history: HashMap::new(),
         }
     }
 
     /// Update spot prices (called whenever fresh price data arrives).
     pub fn update_spots(&mut self, btc: f64, eth: f64) {
-        self.btc_spot = btc;
-        self.eth_spot = eth;
+        if btc > 0.0 {
+            self.btc_spot = btc;
+        }
+        if eth > 0.0 {
+            self.eth_spot = eth;
+        }
+    }
+
+    /// Infer spot prices from order book mid-prices.
+    /// Polymarket binary markets: if we know the threshold from the question
+    /// and the mid-price, we can back out an implied spot.  As a simpler
+    /// heuristic when we have no external feed, we use the order-book
+    /// mid-price directly as the market-implied probability.
+    pub fn update_spots_from_books(&mut self, markets: &[Market], books: &HashMap<String, OrderBook>) {
+        // For each asset, gather the highest-liquidity market's implied spot.
+        // The mid-price of the YES token IS the market's implied P(YES).
+        // We don't need the actual BTC/ETH dollar price — the model compares
+        // our model probability to the market's implied probability.
+        // However, to run the GBM model we DO need the dollar spot.
+        // We estimate it from the most liquid market's threshold + mid-price.
+        for asset in &["BTC", "ETH"] {
+            let mut best_liq = 0.0_f64;
+            let mut best_spot = 0.0_f64;
+            for m in markets.iter().filter(|m| m.asset == *asset) {
+                if let Some(book) = books.get(&m.yes_token_id) {
+                    let liq = book.ask_liquidity(0.05) + book.bid_liquidity(0.05);
+                    if liq > best_liq {
+                        if let Some(threshold) = extract_threshold(&m.question) {
+                            if let Some(mid) = book.mid_price() {
+                                // mid ≈ P(spot > threshold)
+                                // For a rough inverse: spot ≈ threshold * (1 + (mid - 0.5) * factor)
+                                // More accurate: use the GBM inverse, but for bootstrapping
+                                // a simple linear interpolation works.
+                                let offset_factor = 0.05; // 5% of threshold per 0.1 probability unit
+                                let implied_spot = threshold * (1.0 + (mid - 0.5) * offset_factor * 2.0);
+                                if implied_spot > 0.0 {
+                                    best_spot = implied_spot;
+                                    best_liq = liq;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if best_spot > 0.0 {
+                match *asset {
+                    "BTC" => self.btc_spot = best_spot,
+                    "ETH" => self.eth_spot = best_spot,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Record a mid-price observation for adaptive volatility estimation.
+    pub fn record_price(&mut self, token_id: &str, timestamp_secs: f64, mid_price: f64) {
+        let history = self.price_history.entry(token_id.to_string()).or_default();
+        history.push((timestamp_secs, mid_price));
+        // Keep last 200 observations (enough for ~15 minutes at 5s poll)
+        if history.len() > 200 {
+            history.drain(..history.len() - 200);
+        }
+    }
+
+    /// Estimate realized volatility from recent price history, annualized.
+    pub fn estimate_volatility(&self, token_id: &str, default_sigma: f64) -> f64 {
+        let Some(history) = self.price_history.get(token_id) else {
+            return default_sigma;
+        };
+        if history.len() < 10 {
+            return default_sigma;
+        }
+
+        // Compute log-returns and their standard deviation
+        let mut log_returns = Vec::with_capacity(history.len() - 1);
+        let mut avg_dt = 0.0;
+        for i in 1..history.len() {
+            let (t0, p0) = history[i - 1];
+            let (t1, p1) = history[i];
+            if p0 > 0.0 && p1 > 0.0 && t1 > t0 {
+                log_returns.push((p1 / p0).ln());
+                avg_dt += t1 - t0;
+            }
+        }
+        if log_returns.len() < 5 {
+            return default_sigma;
+        }
+        avg_dt /= log_returns.len() as f64;
+
+        let mean = log_returns.iter().sum::<f64>() / log_returns.len() as f64;
+        let variance = log_returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>()
+            / (log_returns.len() - 1) as f64;
+        let std_per_interval = variance.sqrt();
+
+        // Annualize: sigma_annual = sigma_interval * sqrt(intervals_per_year)
+        if avg_dt > 0.0 {
+            let intervals_per_year = (365.25 * 24.0 * 3600.0) / avg_dt;
+            let sigma = std_per_interval * intervals_per_year.sqrt();
+            // Clamp to reasonable range
+            sigma.clamp(0.20, 3.0)
+        } else {
+            default_sigma
+        }
+    }
+
+    /// Count open positions per asset.
+    fn count_per_asset(open_positions: &[(String, usize)], asset: &str) -> usize {
+        open_positions.iter().filter(|(a, _)| a == asset).map(|(_, c)| c).sum()
     }
 
     /// Evaluate a market and return a `Signal` if there is a tradeable
     /// opportunity on either the YES or NO side.
+    ///
+    /// `yes_book` must be the YES token's order book for this market.
+    /// Both YES and NO prices are derived from it (NO price = 1 - YES bid).
+    ///
+    /// `asset_position_counts` maps asset name to count of open positions.
     ///
     /// Returns `None` when no edge is found or conditions are not met.
     pub fn evaluate(
@@ -127,20 +266,28 @@ impl Strategy {
         book: &OrderBook,
         bankroll_usdc: f64,
         open_positions: usize,
+        asset_position_counts: &HashMap<String, usize>,
     ) -> Option<Signal> {
-        // --- Gate 1: position limit -----------------------------------------
+        // --- Gate 1: global position limit ----------------------------------
         if open_positions >= self.risk_cfg.max_open_positions {
             debug!("Max open positions reached");
             return None;
         }
 
-        // --- Gate 2: time limit ---------------------------------------------
+        // --- Gate 2: per-asset concentration limit --------------------------
+        let asset_count = asset_position_counts.get(&market.asset).copied().unwrap_or(0);
+        if asset_count >= MAX_POSITIONS_PER_ASSET {
+            debug!("Max positions for {} reached ({})", market.asset, asset_count);
+            return None;
+        }
+
+        // --- Gate 3: time limit ---------------------------------------------
         if market.is_near_resolution(self.risk_cfg.time_limit_fraction) {
             debug!("Market {} too close to resolution", market.label());
             return None;
         }
 
-        // --- Gate 3: liquidity and spread -----------------------------------
+        // --- Gate 4: liquidity and spread -----------------------------------
         if !check_liquidity(
             book,
             self.cfg.min_liquidity_usdc,
@@ -149,12 +296,13 @@ impl Strategy {
             return None;
         }
 
-        // --- Gate 4: select side and price ----------------------------------
+        // --- Gate 5: select side and price ----------------------------------
         let best_ask = book.best_ask()?;
         let best_bid = book.best_bid()?;
+        let spread = best_ask - best_bid;
 
         // Derive spot price and sigma for this asset
-        let (spot, sigma) = match market.asset.as_str() {
+        let (spot, default_sigma) = match market.asset.as_str() {
             "BTC" => (self.btc_spot, self.btc_sigma),
             "ETH" => (self.eth_spot, self.eth_sigma),
             _ => return None,
@@ -164,8 +312,10 @@ impl Strategy {
             return None;
         }
 
-        // Extract threshold from market question (very rough heuristic;
-        // real implementation would parse structured market data)
+        // Use adaptive volatility if we have enough price history
+        let sigma = self.estimate_volatility(&market.yes_token_id, default_sigma);
+
+        // Extract threshold from market question
         let threshold = extract_threshold(&market.question)?;
         let time_secs = market.seconds_to_resolution();
 
@@ -178,19 +328,30 @@ impl Strategy {
         };
 
         // Model probability that spot > threshold at resolution
-        let p_yes_model = model_probability(spot, threshold, sigma, time_secs);
+        let p_yes_model_raw = model_probability(spot, threshold, sigma, time_secs);
+
+        // Order book imbalance adjustment: strong bid pressure is bullish for YES
+        let imbalance = book_imbalance(book, 0.05);
+        let p_yes_model = (p_yes_model_raw + imbalance * IMBALANCE_WEIGHT).clamp(0.001, 0.999);
         let p_no_model = 1.0 - p_yes_model;
+
+        // Spread-adjusted edge: the real cost of a round-trip is entry at ask,
+        // exit at bid.  Half the spread is lost on each side.
+        let half_spread = spread / 2.0;
+
+        let dyn_min = effective_price_min(self.cfg.price_min, elapsed_fraction);
 
         // Try YES side (buy YES at best ask)
         let yes_entry = best_ask;
-        let dyn_min = effective_price_min(self.cfg.price_min, elapsed_fraction);
+        // Effective market price accounts for spread cost on exit
+        let yes_effective_market = yes_entry + half_spread;
         if yes_entry >= dyn_min
             && yes_entry <= self.cfg.price_max
-            && p_yes_model > yes_entry + self.cfg.min_edge
+            && p_yes_model > yes_effective_market + self.cfg.min_edge
         {
             let kelly = compute_bet(
                 p_yes_model,
-                yes_entry,
+                yes_effective_market, // use spread-adjusted price for Kelly
                 bankroll_usdc,
                 self.kelly_cfg.fraction,
                 self.kelly_cfg.max_position_pct,
@@ -211,15 +372,16 @@ impl Strategy {
             }
         }
 
-        // Try NO side (buy NO at 1 − best_bid, because NO price = 1 − YES bid)
-        let no_entry = 1.0 - best_bid; // implied NO ask
+        // Try NO side (buy NO at 1 - best_bid, because NO price = 1 - YES bid)
+        let no_entry = 1.0 - best_bid;
+        let no_effective_market = no_entry + half_spread;
         if no_entry >= dyn_min
             && no_entry <= self.cfg.price_max
-            && p_no_model > no_entry + self.cfg.min_edge
+            && p_no_model > no_effective_market + self.cfg.min_edge
         {
             let kelly = compute_bet(
                 p_no_model,
-                no_entry,
+                no_effective_market,
                 bankroll_usdc,
                 self.kelly_cfg.fraction,
                 self.kelly_cfg.max_position_pct,

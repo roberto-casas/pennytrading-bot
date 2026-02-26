@@ -1,5 +1,5 @@
-/// trader.rs – Order management: open/close positions, SL/TP monitoring,
-/// trade resolution checking, and dry-run support.
+/// trader.rs – Order management: open/close positions, SL/TP/trailing-stop
+/// monitoring, trade resolution checking, and dry-run support.
 use anyhow::Result;
 use chrono::Utc;
 use tracing::{info, warn};
@@ -16,6 +16,9 @@ use crate::{
 // ---------------------------------------------------------------------------
 // Trader
 // ---------------------------------------------------------------------------
+
+/// Trailing stop percentage (how far below the high-water mark to trigger).
+const TRAILING_STOP_PCT: f64 = 0.20; // 20% below peak
 
 pub struct Trader {
     pub risk: RiskConfig,
@@ -39,8 +42,7 @@ impl Trader {
     /// Open a position based on a strategy signal.
     ///
     /// Prefers a **limit order** at the best ask (or slightly inside the spread)
-    /// when `strategy.prefer_limit_orders` is true.  Falls back to a market
-    /// order if the book is thin.
+    /// when `strategy.prefer_limit_orders` is true.
     pub async fn open_position(
         &self,
         signal: &Signal,
@@ -55,13 +57,11 @@ impl Trader {
             OrderType::Market
         };
 
-        // Determine the limit price – try to get a slightly better price
-        // than best ask by placing our limit 0.001 inside the spread.
-        let limit_price = if order_type == OrderType::Limit {
-            (signal.entry_price + 0.001).min(signal.entry_price * 1.01)
-        } else {
-            signal.entry_price
-        };
+        // Limit price: place AT the best ask for immediate fill potential.
+        // Adding to the ask only makes us pay more; subtracting risks no fill.
+        // Use the signal's entry_price directly (which is already best_ask or
+        // derived NO ask).
+        let limit_price = signal.entry_price;
 
         let resp = match order_type {
             OrderType::Limit => {
@@ -110,6 +110,7 @@ impl Trader {
             cost_usdc: signal.bet_usdc,
             stop_loss_price,
             take_profit_price,
+            high_water_mark: signal.entry_price,
             status,
             exit_price: None,
             pnl_usdc: None,
@@ -199,11 +200,11 @@ impl Trader {
     }
 
     // ------------------------------------------------------------------
-    // Monitor open positions (SL / TP / time limit)
+    // Monitor open positions (SL / TP / trailing stop / time limit)
     // ------------------------------------------------------------------
 
-    /// Check all open positions against stop-loss, take-profit and time-limit
-    /// rules.  Returns the list of positions that were closed.
+    /// Check all open positions against stop-loss, take-profit, trailing stop,
+    /// and time-limit rules.  Returns the list of positions that were closed.
     pub async fn monitor_positions(
         &self,
         positions: &mut Vec<Position>,
@@ -220,22 +221,29 @@ impl Trader {
                 continue;
             }
 
-            // Resolve current price from order book
+            // Resolve current price from order book (best bid for selling)
             let current_price = order_books
                 .get(&pos.token_id)
-                .and_then(|b| match pos.side {
-                    Side::YES => b.best_bid(), // we'd sell into the bid
-                    Side::NO => b.best_bid(),
-                })
+                .and_then(|b| b.best_bid())
                 .unwrap_or(pos.entry_price);
 
             // Find the associated market for time-limit check
             let market = markets.iter().find(|m| m.condition_id == pos.market_id);
 
+            // Update trailing stop high-water mark
+            let trailing_stop_price = pos.update_trailing_stop(current_price, TRAILING_STOP_PCT);
+
             let (trigger_close, close_status) = if pos.should_stop_loss(current_price) {
                 (true, TradeStatus::ClosedStopLoss)
             } else if pos.should_take_profit(current_price) {
                 (true, TradeStatus::ClosedTakeProfit)
+            } else if let Some(trail_price) = trailing_stop_price {
+                // Trailing stop: only triggers if price dropped below trail
+                if current_price <= trail_price {
+                    (true, TradeStatus::ClosedTakeProfit) // trailing stop is a profit-lock
+                } else {
+                    (false, TradeStatus::Open)
+                }
             } else if market
                 .map(|m| m.is_near_resolution(self.risk.time_limit_fraction))
                 .unwrap_or(false)
@@ -260,11 +268,6 @@ impl Trader {
     // ------------------------------------------------------------------
 
     /// Check whether markets have resolved and update positions accordingly.
-    ///
-    /// For each resolved market where we hold a position, we:
-    ///  1. Determine the payout (1.0 or 0.0 per share).
-    ///  2. Compute PnL.
-    ///  3. Mark the position as RESOLVED_WIN or RESOLVED_LOSS.
     pub fn check_resolution(
         &self,
         positions: &mut Vec<Position>,

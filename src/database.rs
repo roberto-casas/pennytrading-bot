@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS positions (
     cost_usdc           REAL NOT NULL,
     stop_loss_price     REAL NOT NULL,
     take_profit_price   REAL NOT NULL,
+    high_water_mark     REAL NOT NULL DEFAULT 0.0,
     status              TEXT NOT NULL DEFAULT 'OPEN',
     exit_price          REAL,
     pnl_usdc            REAL,
@@ -276,15 +277,16 @@ impl Database {
                 "INSERT INTO positions
                     (position_id, session_id, market_id, token_id, side, asset,
                      entry_price, size, cost_usdc,
-                     stop_loss_price, take_profit_price,
+                     stop_loss_price, take_profit_price, high_water_mark,
                      status, exit_price, pnl_usdc,
                      opened_at, closed_at, dry_run, order_type)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
                  ON CONFLICT(position_id) DO UPDATE SET
-                    status        = excluded.status,
-                    exit_price    = excluded.exit_price,
-                    pnl_usdc      = excluded.pnl_usdc,
-                    closed_at     = excluded.closed_at",
+                    status          = excluded.status,
+                    exit_price      = excluded.exit_price,
+                    pnl_usdc        = excluded.pnl_usdc,
+                    closed_at       = excluded.closed_at,
+                    high_water_mark = excluded.high_water_mark",
                 params![
                     pos.position_id,
                     session_id,
@@ -297,6 +299,7 @@ impl Database {
                     pos.cost_usdc,
                     pos.stop_loss_price,
                     pos.take_profit_price,
+                    pos.high_water_mark,
                     pos.status.as_str(),
                     pos.exit_price,
                     pos.pnl_usdc,
@@ -351,17 +354,21 @@ impl Database {
         let status_str: String = row.get("status")?;
         let order_type_str: String = row.get::<_, Option<String>>("order_type")?
             .unwrap_or_else(|| "LIMIT".into());
+        let entry_price: f64 = row.get("entry_price")?;
+        let high_water_mark: f64 = row.get::<_, Option<f64>>("high_water_mark")?
+            .unwrap_or(entry_price);
         Ok(Position {
             position_id: row.get("position_id")?,
             market_id: row.get("market_id")?,
             token_id: row.get("token_id")?,
             side: side_str.parse().unwrap_or(Side::YES),
             asset: row.get("asset")?,
-            entry_price: row.get("entry_price")?,
+            entry_price,
             size: row.get("size")?,
             cost_usdc: row.get("cost_usdc")?,
             stop_loss_price: row.get("stop_loss_price")?,
             take_profit_price: row.get("take_profit_price")?,
+            high_water_mark,
             status: status_str.parse().unwrap_or(TradeStatus::Open),
             exit_price: row.get("exit_price")?,
             pnl_usdc: row.get("pnl_usdc")?,
