@@ -1,0 +1,5 @@
+pennytrading.db
+/target/
+*.db-shm
+*.db-wal
+.env

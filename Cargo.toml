@@ -1,0 +1,41 @@
+[package]
+name = "pennytrading-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Polymarket penny strategy trading bot – WebSocket data feed, SQLite persistence, ratatui dashboard"
+
+[[bin]]
+name = "pennytrading-bot"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio          = { version = "1",    features = ["full"] }
+# WebSocket (wss:// via rustls)
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+# HTTP client
+reqwest        = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# SQLite
+rusqlite       = { version = "0.31", features = ["bundled"] }
+# Terminal UI
+ratatui        = "0.26"
+crossterm      = { version = "0.27", features = ["event-stream"] }
+# CLI
+clap           = { version = "4",    features = ["derive"] }
+# Serde
+serde          = { version = "1",    features = ["derive"] }
+serde_json     = "1"
+serde_yaml     = "0.9"
+# Logging
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Utilities
+uuid           = { version = "1",    features = ["v4"] }
+chrono         = { version = "0.4",  features = ["serde"] }
+anyhow         = "1"
+dotenvy        = "0.15"
+futures-util   = "0.3"
+tokio-stream   = "0.1"
+
+[dev-dependencies]
+tempfile       = "3"
