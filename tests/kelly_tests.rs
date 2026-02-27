@@ -115,7 +115,7 @@ fn model_probability_longer_time_more_uncertainty() {
     let spot = 50_100.0;
     let threshold = 50_000.0;
     let p_short = model_probability(spot, threshold, 0.80, 30.0);
-    let p_long  = model_probability(spot, threshold, 0.80, 300.0);
+    let p_long = model_probability(spot, threshold, 0.80, 300.0);
     // More time → d is smaller → probability closer to 0.5, i.e. p_long < p_short
     assert!(
         p_short > p_long,

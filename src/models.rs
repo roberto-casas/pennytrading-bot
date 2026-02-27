@@ -300,6 +300,53 @@ impl Position {
 }
 
 // ---------------------------------------------------------------------------
+// Trade diagnostics (for calibration and post-trade analytics)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeDiagnostics {
+    pub position_id: String,
+    pub session_id: String,
+    pub market_id: String,
+    pub asset: String,
+    pub side: Side,
+    /// Forecast probability for the traded side at entry.
+    pub model_prob: f64,
+    /// Market-implied probability for the traded side at entry.
+    pub market_prob: f64,
+    /// model_prob - market_prob
+    pub edge: f64,
+    /// Composite regime at entry (`vol|spread|liquidity|event`).
+    pub regime: String,
+    pub entry_price: f64,
+    pub bet_usdc: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CalibrationStats {
+    pub sample_size: usize,
+    pub model_brier: f64,
+    pub market_brier: f64,
+    pub avg_edge: f64,
+    pub model_edge_hit_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedTradeSample {
+    pub position_id: String,
+    pub asset: String,
+    pub regime: String,
+    pub edge: f64,
+    pub model_prob: f64,
+    pub market_prob: f64,
+    pub pnl_usdc: f64,
+    pub outcome: f64,
+    pub created_at: DateTime<Utc>,
+    pub closed_at: DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
 // Bot session (one run)
 // ---------------------------------------------------------------------------
 
@@ -325,6 +372,10 @@ pub struct AppState {
     pub started_at: Option<DateTime<Utc>>,
     pub dry_run: bool,
     pub balance_usdc: f64,
+    pub session_start_equity: f64,
+    pub session_peak_equity: f64,
+    pub entries_paused: bool,
+    pub pause_reason: Option<String>,
     pub markets: Vec<Market>,
     /// token_id → OrderBook
     pub order_books: std::collections::HashMap<String, OrderBook>,

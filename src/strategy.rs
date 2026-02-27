@@ -8,11 +8,11 @@
 ///   5. Enforces price, time, and per-asset concentration limits.
 ///   6. Returns a `Signal` if all conditions are met.
 use crate::{
-    config::{KellyConfig, RiskConfig, StrategyConfig},
+    config::{AdaptiveConfig, KellyConfig, RiskConfig, StrategyConfig},
     kelly::{compute_bet, model_probability, BetResult},
-    models::{Market, OrderBook, Side},
+    models::{CalibrationStats, Market, OrderBook, Side},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -34,6 +34,15 @@ pub struct Signal {
     pub p_model: f64,
     /// Market-implied probability (best bid or ask depending on side).
     pub p_market: f64,
+    /// Composite regime bucket at signal time (`vol|spread|liquidity|event`).
+    pub regime: String,
+}
+
+impl Signal {
+    /// Rank opportunities by expected edge weighted by size.
+    pub fn score(&self) -> f64 {
+        self.kelly.edge.max(0.0) * self.bet_usdc.max(0.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -41,11 +50,7 @@ pub struct Signal {
 // ---------------------------------------------------------------------------
 
 /// Check whether the order book has enough liquidity and a tight enough spread.
-pub fn check_liquidity(
-    book: &OrderBook,
-    min_liquidity_usdc: f64,
-    max_spread_pct: f64,
-) -> bool {
+pub fn check_liquidity(book: &OrderBook, min_liquidity_usdc: f64, max_spread_pct: f64) -> bool {
     let Some(spread_pct) = book.spread_pct() else {
         return false;
     };
@@ -61,9 +66,7 @@ pub fn check_liquidity(
     // Need sufficient ask-side liquidity to buy into
     let ask_liq = book.ask_liquidity(0.05);
     if ask_liq < min_liquidity_usdc {
-        debug!(
-            "Insufficient ask liquidity: ${ask_liq:.0} < ${min_liquidity_usdc:.0}"
-        );
+        debug!("Insufficient ask liquidity: ${ask_liq:.0} < ${min_liquidity_usdc:.0}");
         return false;
     }
     true
@@ -107,6 +110,14 @@ const MAX_POSITIONS_PER_ASSET: usize = 3;
 
 /// Weight of order-book imbalance signal (additive to model probability).
 const IMBALANCE_WEIGHT: f64 = 0.02;
+/// Extra execution/risk buffer on top of configured edge floor.
+const BASE_EDGE_BUFFER: f64 = 0.01;
+
+#[derive(Debug, Clone, Copy)]
+struct RegimeTrack {
+    min_edge: f64,
+    kelly_fraction: f64,
+}
 
 pub struct Strategy {
     pub cfg: StrategyConfig,
@@ -123,10 +134,30 @@ pub struct Strategy {
     /// Rolling mid-price history per token for realized volatility estimation.
     /// token_id -> Vec<(timestamp_secs, mid_price)>
     price_history: HashMap<String, Vec<(f64, f64)>>,
+    base_track: RegimeTrack,
+    regime_tracks: HashMap<String, RegimeTrack>,
+    regime_sigma_threshold: f64,
+    regime_wide_spread_pct: f64,
+    regime_thin_liquidity_mult: f64,
+    event_regime_enabled: bool,
+    global_event_active: bool,
+    event_assets: std::collections::HashSet<String>,
+    event_keywords: Vec<String>,
+    runtime_global_event_active: bool,
+    runtime_event_assets: std::collections::HashSet<String>,
 }
 
 impl Strategy {
-    pub fn new(cfg: StrategyConfig, kelly_cfg: KellyConfig, risk_cfg: RiskConfig) -> Self {
+    pub fn new(
+        cfg: StrategyConfig,
+        kelly_cfg: KellyConfig,
+        risk_cfg: RiskConfig,
+        adaptive_cfg: AdaptiveConfig,
+    ) -> Self {
+        let base_track = RegimeTrack {
+            min_edge: cfg.min_edge,
+            kelly_fraction: kelly_cfg.fraction,
+        };
         Self {
             cfg,
             kelly_cfg,
@@ -136,7 +167,207 @@ impl Strategy {
             btc_sigma: 0.80,
             eth_sigma: 0.90,
             price_history: HashMap::new(),
+            base_track,
+            regime_tracks: HashMap::new(),
+            regime_sigma_threshold: adaptive_cfg.regime_sigma_threshold,
+            regime_wide_spread_pct: adaptive_cfg.regime_wide_spread_pct,
+            regime_thin_liquidity_mult: adaptive_cfg.regime_thin_liquidity_mult,
+            event_regime_enabled: adaptive_cfg.event_regime_enabled,
+            global_event_active: adaptive_cfg.global_event_active,
+            event_assets: adaptive_cfg
+                .event_assets
+                .into_iter()
+                .map(|a| a.to_uppercase())
+                .collect(),
+            event_keywords: adaptive_cfg
+                .event_keywords
+                .into_iter()
+                .map(|k| k.to_lowercase())
+                .collect(),
+            runtime_global_event_active: false,
+            runtime_event_assets: std::collections::HashSet::new(),
         }
+    }
+
+    pub fn set_external_event_state(
+        &mut self,
+        global_active: bool,
+        event_assets: &std::collections::HashSet<String>,
+    ) {
+        self.runtime_global_event_active = global_active;
+        self.runtime_event_assets = event_assets.iter().map(|a| a.to_uppercase()).collect();
+    }
+
+    /// Adjust strategy aggressiveness based on recent calibration outcomes.
+    ///
+    /// If model Brier score is worse than the market baseline by `brier_margin`,
+    /// tighten risk by raising `min_edge` and lowering `kelly.fraction`.
+    /// If model Brier score is better by the same margin, loosen gradually.
+    pub fn adapt_from_calibration(
+        &mut self,
+        stats: &CalibrationStats,
+        adaptive: &AdaptiveConfig,
+    ) -> Option<String> {
+        if !adaptive.enabled || stats.sample_size < adaptive.min_resolved_trades {
+            return None;
+        }
+
+        let old_edge = self.cfg.min_edge;
+        let old_kelly = self.kelly_cfg.fraction;
+
+        if stats.model_brier > stats.market_brier + adaptive.brier_margin {
+            self.cfg.min_edge = (self.cfg.min_edge + adaptive.edge_step).min(adaptive.max_edge_cap);
+            self.kelly_cfg.fraction =
+                (self.kelly_cfg.fraction - adaptive.kelly_step).max(adaptive.min_kelly_fraction);
+        } else if stats.market_brier > stats.model_brier + adaptive.brier_margin {
+            self.cfg.min_edge =
+                (self.cfg.min_edge - adaptive.edge_step).max(adaptive.min_edge_floor);
+            self.kelly_cfg.fraction =
+                (self.kelly_cfg.fraction + adaptive.kelly_step).min(adaptive.max_kelly_fraction);
+        }
+
+        if (self.cfg.min_edge - old_edge).abs() < 1e-12
+            && (self.kelly_cfg.fraction - old_kelly).abs() < 1e-12
+        {
+            return None;
+        }
+        self.base_track.min_edge = self.cfg.min_edge;
+        self.base_track.kelly_fraction = self.kelly_cfg.fraction;
+
+        Some(format!(
+            "Adaptive retune: min_edge {:.3}->{:.3}, kelly {:.3}->{:.3}, brier(model={:.4}, market={:.4}, n={})",
+            old_edge,
+            self.cfg.min_edge,
+            old_kelly,
+            self.kelly_cfg.fraction,
+            stats.model_brier,
+            stats.market_brier,
+            stats.sample_size,
+        ))
+    }
+
+    pub fn adapt_from_calibration_for_regime(
+        &mut self,
+        stats: &CalibrationStats,
+        adaptive: &AdaptiveConfig,
+        regime: &str,
+    ) -> Option<String> {
+        if !adaptive.enabled || stats.sample_size < adaptive.min_resolved_trades {
+            return None;
+        }
+
+        let track = self.track_for_regime_mut(regime);
+        let old_edge = track.min_edge;
+        let old_kelly = track.kelly_fraction;
+
+        if stats.model_brier > stats.market_brier + adaptive.brier_margin {
+            track.min_edge = (track.min_edge + adaptive.edge_step).min(adaptive.max_edge_cap);
+            track.kelly_fraction =
+                (track.kelly_fraction - adaptive.kelly_step).max(adaptive.min_kelly_fraction);
+        } else if stats.market_brier > stats.model_brier + adaptive.brier_margin {
+            track.min_edge = (track.min_edge - adaptive.edge_step).max(adaptive.min_edge_floor);
+            track.kelly_fraction =
+                (track.kelly_fraction + adaptive.kelly_step).min(adaptive.max_kelly_fraction);
+        }
+
+        if (track.min_edge - old_edge).abs() < 1e-12
+            && (track.kelly_fraction - old_kelly).abs() < 1e-12
+        {
+            return None;
+        }
+
+        Some(format!(
+            "Adaptive retune [{}]: min_edge {:.3}->{:.3}, kelly {:.3}->{:.3}, brier(model={:.4}, market={:.4}, n={})",
+            regime,
+            old_edge,
+            track.min_edge,
+            old_kelly,
+            track.kelly_fraction,
+            stats.model_brier,
+            stats.market_brier,
+            stats.sample_size,
+        ))
+    }
+
+    fn regime_bucket(&self, market: &Market, sigma: f64, spread_pct: f64, ask_liq: f64) -> String {
+        let sigma_bucket = if sigma >= self.regime_sigma_threshold {
+            "high_vol"
+        } else {
+            "low_vol"
+        };
+        let spread_bucket = if spread_pct >= self.regime_wide_spread_pct {
+            "wide_spread"
+        } else {
+            "normal_spread"
+        };
+        let liq_cutoff = self.cfg.min_liquidity_usdc * self.regime_thin_liquidity_mult;
+        let liq_bucket = if ask_liq < liq_cutoff {
+            "thin_liq"
+        } else {
+            "normal_liq"
+        };
+        let event_bucket = if self.is_event_regime(market) {
+            "event"
+        } else {
+            "normal_event"
+        };
+        format!("{sigma_bucket}|{spread_bucket}|{liq_bucket}|{event_bucket}")
+    }
+
+    fn track_for_regime(&self, regime: &str) -> RegimeTrack {
+        self.regime_tracks
+            .get(regime)
+            .copied()
+            .unwrap_or(self.base_track)
+    }
+
+    fn track_for_regime_mut(&mut self, regime: &str) -> &mut RegimeTrack {
+        self.regime_tracks
+            .entry(regime.to_string())
+            .or_insert(self.base_track)
+    }
+
+    #[cfg(test)]
+    fn track_snapshot_for_test(&self, regime: &str) -> RegimeTrack {
+        self.track_for_regime(regime)
+    }
+
+    #[cfg(test)]
+    fn classify_regime_for_test(
+        &self,
+        market: &Market,
+        sigma: f64,
+        spread_pct: f64,
+        ask_liq: f64,
+    ) -> String {
+        self.regime_bucket(market, sigma, spread_pct, ask_liq)
+    }
+
+    fn market_microstructure_features(&self, book: &OrderBook, spread: f64) -> (f64, f64) {
+        let ask_liq = book.ask_liquidity(0.05);
+        let spread_pct = book
+            .mid_price()
+            .filter(|m| *m > 0.0)
+            .map(|m| (spread / m).max(0.0))
+            .unwrap_or(0.0);
+        (spread_pct, ask_liq)
+    }
+
+    fn is_event_regime(&self, market: &Market) -> bool {
+        if !self.event_regime_enabled {
+            return false;
+        }
+        if self.global_event_active || self.runtime_global_event_active {
+            return true;
+        }
+        let market_asset = market.asset.to_uppercase();
+        if self.event_assets.contains(&market_asset)
+            || self.runtime_event_assets.contains(&market_asset)
+        {
+            return true;
+        }
+        let q = market.question.to_lowercase();
+        self.event_keywords.iter().any(|k| q.contains(k))
     }
 
     /// Update spot prices (called whenever fresh price data arrives).
@@ -154,7 +385,11 @@ impl Strategy {
     /// and the mid-price, we can back out an implied spot.  As a simpler
     /// heuristic when we have no external feed, we use the order-book
     /// mid-price directly as the market-implied probability.
-    pub fn update_spots_from_books(&mut self, markets: &[Market], books: &HashMap<String, OrderBook>) {
+    pub fn update_spots_from_books(
+        &mut self,
+        markets: &[Market],
+        books: &HashMap<String, OrderBook>,
+    ) {
         // For each asset, gather the highest-liquidity market's implied spot.
         // The mid-price of the YES token IS the market's implied P(YES).
         // We don't need the actual BTC/ETH dollar price — the model compares
@@ -175,7 +410,8 @@ impl Strategy {
                                 // More accurate: use the GBM inverse, but for bootstrapping
                                 // a simple linear interpolation works.
                                 let offset_factor = 0.05; // 5% of threshold per 0.1 probability unit
-                                let implied_spot = threshold * (1.0 + (mid - 0.5) * offset_factor * 2.0);
+                                let implied_spot =
+                                    threshold * (1.0 + (mid - 0.5) * offset_factor * 2.0);
                                 if implied_spot > 0.0 {
                                     best_spot = implied_spot;
                                     best_liq = liq;
@@ -203,6 +439,13 @@ impl Strategy {
         if history.len() > 200 {
             history.drain(..history.len() - 200);
         }
+    }
+
+    /// Remove historical series for tokens that are no longer tracked.
+    /// This prevents unbounded growth when market IDs rotate over time.
+    pub fn prune_price_history(&mut self, active_token_ids: &HashSet<String>) {
+        self.price_history
+            .retain(|token_id, _| active_token_ids.contains(token_id));
     }
 
     /// Estimate realized volatility from recent price history, annualized.
@@ -248,7 +491,11 @@ impl Strategy {
 
     /// Count open positions per asset.
     fn count_per_asset(open_positions: &[(String, usize)], asset: &str) -> usize {
-        open_positions.iter().filter(|(a, _)| a == asset).map(|(_, c)| c).sum()
+        open_positions
+            .iter()
+            .filter(|(a, _)| a == asset)
+            .map(|(_, c)| c)
+            .sum()
     }
 
     /// Evaluate a market and return a `Signal` if there is a tradeable
@@ -275,9 +522,15 @@ impl Strategy {
         }
 
         // --- Gate 2: per-asset concentration limit --------------------------
-        let asset_count = asset_position_counts.get(&market.asset).copied().unwrap_or(0);
+        let asset_count = asset_position_counts
+            .get(&market.asset)
+            .copied()
+            .unwrap_or(0);
         if asset_count >= MAX_POSITIONS_PER_ASSET {
-            debug!("Max positions for {} reached ({})", market.asset, asset_count);
+            debug!(
+                "Max positions for {} reached ({})",
+                market.asset, asset_count
+            );
             return None;
         }
 
@@ -288,11 +541,7 @@ impl Strategy {
         }
 
         // --- Gate 4: liquidity and spread -----------------------------------
-        if !check_liquidity(
-            book,
-            self.cfg.min_liquidity_usdc,
-            self.cfg.max_spread_pct,
-        ) {
+        if !check_liquidity(book, self.cfg.min_liquidity_usdc, self.cfg.max_spread_pct) {
             return None;
         }
 
@@ -314,6 +563,9 @@ impl Strategy {
 
         // Use adaptive volatility if we have enough price history
         let sigma = self.estimate_volatility(&market.yes_token_id, default_sigma);
+        let (spread_pct, ask_liq) = self.market_microstructure_features(book, spread);
+        let regime = self.regime_bucket(market, sigma, spread_pct, ask_liq);
+        let regime_track = self.track_for_regime(&regime);
 
         // Extract threshold from market question
         let threshold = extract_threshold(&market.question)?;
@@ -341,19 +593,23 @@ impl Strategy {
 
         let dyn_min = effective_price_min(self.cfg.price_min, elapsed_fraction);
 
+        // Require extra edge to compensate for slippage/adverse selection.
+        let required_edge =
+            regime_track.min_edge + BASE_EDGE_BUFFER + spread * 0.25 + imbalance.abs() * 0.005;
+
         // Try YES side (buy YES at best ask)
         let yes_entry = best_ask;
         // Effective market price accounts for spread cost on exit
         let yes_effective_market = yes_entry + half_spread;
         if yes_entry >= dyn_min
             && yes_entry <= self.cfg.price_max
-            && p_yes_model > yes_effective_market + self.cfg.min_edge
+            && p_yes_model > yes_effective_market + required_edge
         {
             let kelly = compute_bet(
                 p_yes_model,
                 yes_effective_market, // use spread-adjusted price for Kelly
                 bankroll_usdc,
-                self.kelly_cfg.fraction,
+                regime_track.kelly_fraction,
                 self.kelly_cfg.max_position_pct,
                 self.kelly_cfg.min_bet_usdc,
                 self.kelly_cfg.max_bet_usdc,
@@ -367,6 +623,7 @@ impl Strategy {
                     bet_usdc: kelly.bet_usdc,
                     p_model: p_yes_model,
                     p_market: yes_entry,
+                    regime: regime.clone(),
                     kelly,
                 });
             }
@@ -377,13 +634,13 @@ impl Strategy {
         let no_effective_market = no_entry + half_spread;
         if no_entry >= dyn_min
             && no_entry <= self.cfg.price_max
-            && p_no_model > no_effective_market + self.cfg.min_edge
+            && p_no_model > no_effective_market + required_edge
         {
             let kelly = compute_bet(
                 p_no_model,
                 no_effective_market,
                 bankroll_usdc,
-                self.kelly_cfg.fraction,
+                regime_track.kelly_fraction,
                 self.kelly_cfg.max_position_pct,
                 self.kelly_cfg.min_bet_usdc,
                 self.kelly_cfg.max_bet_usdc,
@@ -397,6 +654,7 @@ impl Strategy {
                     bet_usdc: kelly.bet_usdc,
                     p_model: p_no_model,
                     p_market: no_entry,
+                    regime: regime.clone(),
                     kelly,
                 });
             }
@@ -418,7 +676,10 @@ pub fn extract_threshold(question: &str) -> Option<f64> {
     // Try to find a dollar amount like $50,000 or $50000
     let re_dollar = r"\$([0-9][0-9,]*)";
     if let Some(s) = first_regex_match(question, re_dollar) {
-        let clean: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+        let clean: String = s
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
         return clean.parse::<f64>().ok();
     }
     // Try bare number followed by "k" (e.g. "50k") or nothing
@@ -427,7 +688,10 @@ pub fn extract_threshold(question: &str) -> Option<f64> {
     let mut candidates: Vec<f64> = question
         .split_whitespace()
         .filter_map(|w| {
-            let clean: String = w.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+            let clean: String = w
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
             clean.parse::<f64>().ok()
         })
         .filter(|&v| v >= 100.0) // threshold must be at least $100
@@ -466,16 +730,39 @@ fn first_regex_match<'a>(text: &'a str, _pattern: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::PriceLevel;
+    use crate::models::{Market, PriceLevel};
     use chrono::Utc;
+    use std::collections::HashSet;
 
     fn mock_book(bid: f64, ask: f64, liq: f64) -> OrderBook {
         OrderBook {
             market_id: "test".into(),
             token_id: "tok".into(),
             timestamp: Utc::now(),
-            bids: vec![PriceLevel { price: bid, size: liq / bid }],
-            asks: vec![PriceLevel { price: ask, size: liq / ask }],
+            bids: vec![PriceLevel {
+                price: bid,
+                size: liq / bid,
+            }],
+            asks: vec![PriceLevel {
+                price: ask,
+                size: liq / ask,
+            }],
+        }
+    }
+
+    fn mock_market(asset: &str, question: &str) -> Market {
+        Market {
+            condition_id: "cond_test".to_string(),
+            question: question.to_string(),
+            yes_token_id: "yes_tok".to_string(),
+            no_token_id: "no_tok".to_string(),
+            asset: asset.to_string(),
+            resolution_minutes: 5,
+            end_date_iso: "2099-01-01T00:00:00Z".to_string(),
+            active: true,
+            closed: false,
+            resolved: false,
+            resolution_price: None,
         }
     }
 
@@ -509,7 +796,10 @@ mod tests {
 
     #[test]
     fn test_extract_threshold_dollar() {
-        assert_eq!(extract_threshold("Will BTC be above $50,000?"), Some(50000.0));
+        assert_eq!(
+            extract_threshold("Will BTC be above $50,000?"),
+            Some(50000.0)
+        );
         assert_eq!(extract_threshold("Will ETH be above $3,000?"), Some(3000.0));
     }
 
@@ -522,5 +812,168 @@ mod tests {
     #[test]
     fn test_extract_threshold_none() {
         assert_eq!(extract_threshold("Will it rain today?"), None);
+    }
+
+    #[test]
+    fn test_prune_price_history_removes_stale_tokens() {
+        let mut strat = Strategy::new(
+            StrategyConfig::default(),
+            KellyConfig::default(),
+            RiskConfig::default(),
+            AdaptiveConfig::default(),
+        );
+        strat.record_price("tok_a", 1.0, 0.5);
+        strat.record_price("tok_b", 1.0, 0.5);
+
+        let active: HashSet<String> = ["tok_a".to_string()].into_iter().collect();
+        strat.prune_price_history(&active);
+
+        assert!(strat.price_history.contains_key("tok_a"));
+        assert!(!strat.price_history.contains_key("tok_b"));
+    }
+
+    #[test]
+    fn test_adaptive_tune_tightens_when_model_underperforms_market() {
+        let mut strat = Strategy::new(
+            StrategyConfig::default(),
+            KellyConfig::default(),
+            RiskConfig::default(),
+            AdaptiveConfig::default(),
+        );
+        let adaptive = AdaptiveConfig::default();
+        let stats = CalibrationStats {
+            sample_size: 50,
+            model_brier: 0.24,
+            market_brier: 0.18,
+            avg_edge: 0.02,
+            model_edge_hit_rate: 0.4,
+        };
+
+        let msg = strat.adapt_from_calibration(&stats, &adaptive);
+        assert!(msg.is_some());
+        assert!(strat.cfg.min_edge > StrategyConfig::default().min_edge);
+        assert!(strat.kelly_cfg.fraction < KellyConfig::default().fraction);
+    }
+
+    #[test]
+    fn test_adaptive_tune_loosens_when_model_beats_market() {
+        let mut strat = Strategy::new(
+            StrategyConfig::default(),
+            KellyConfig::default(),
+            RiskConfig::default(),
+            AdaptiveConfig::default(),
+        );
+        strat.cfg.min_edge = 0.08;
+        strat.kelly_cfg.fraction = 0.20;
+
+        let adaptive = AdaptiveConfig::default();
+        let stats = CalibrationStats {
+            sample_size: 50,
+            model_brier: 0.12,
+            market_brier: 0.19,
+            avg_edge: 0.02,
+            model_edge_hit_rate: 0.6,
+        };
+
+        let msg = strat.adapt_from_calibration(&stats, &adaptive);
+        assert!(msg.is_some());
+        assert!(strat.cfg.min_edge < 0.08);
+        assert!(strat.kelly_cfg.fraction > 0.20);
+    }
+
+    #[test]
+    fn test_adaptive_tune_skips_when_sample_is_too_small() {
+        let mut strat = Strategy::new(
+            StrategyConfig::default(),
+            KellyConfig::default(),
+            RiskConfig::default(),
+            AdaptiveConfig::default(),
+        );
+        let adaptive = AdaptiveConfig::default();
+        let stats = CalibrationStats {
+            sample_size: 5,
+            model_brier: 0.30,
+            market_brier: 0.10,
+            avg_edge: 0.0,
+            model_edge_hit_rate: 0.0,
+        };
+
+        let old_edge = strat.cfg.min_edge;
+        let old_kelly = strat.kelly_cfg.fraction;
+        assert!(strat.adapt_from_calibration(&stats, &adaptive).is_none());
+        assert!((strat.cfg.min_edge - old_edge).abs() < 1e-12);
+        assert!((strat.kelly_cfg.fraction - old_kelly).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_regime_tuning_updates_only_selected_bucket() {
+        let mut strat = Strategy::new(
+            StrategyConfig::default(),
+            KellyConfig::default(),
+            RiskConfig::default(),
+            AdaptiveConfig::default(),
+        );
+        let adaptive = AdaptiveConfig::default();
+        let stats = CalibrationStats {
+            sample_size: 50,
+            model_brier: 0.30,
+            market_brier: 0.15,
+            avg_edge: 0.0,
+            model_edge_hit_rate: 0.0,
+        };
+
+        let low_before =
+            strat.track_snapshot_for_test("low_vol|normal_spread|normal_liq|normal_event");
+        let high_before =
+            strat.track_snapshot_for_test("high_vol|normal_spread|normal_liq|normal_event");
+
+        let msg = strat.adapt_from_calibration_for_regime(
+            &stats,
+            &adaptive,
+            "high_vol|normal_spread|normal_liq|normal_event",
+        );
+        assert!(msg.is_some());
+        let low_after =
+            strat.track_snapshot_for_test("low_vol|normal_spread|normal_liq|normal_event");
+        let high_after =
+            strat.track_snapshot_for_test("high_vol|normal_spread|normal_liq|normal_event");
+        assert!((low_after.min_edge - low_before.min_edge).abs() < 1e-12);
+        assert!((low_after.kelly_fraction - low_before.kelly_fraction).abs() < 1e-12);
+        assert!(high_after.min_edge > high_before.min_edge);
+        assert!(high_after.kelly_fraction < high_before.kelly_fraction);
+    }
+
+    #[test]
+    fn test_regime_classification_uses_sigma_spread_and_liquidity() {
+        let strat = Strategy::new(
+            StrategyConfig::default(),
+            KellyConfig::default(),
+            RiskConfig::default(),
+            AdaptiveConfig::default(),
+        );
+        let market = mock_market("BTC", "Will BTC be above $50,000?");
+        let low =
+            strat.classify_regime_for_test(&market, 0.9, 0.01, strat.cfg.min_liquidity_usdc * 3.0);
+        let stressed =
+            strat.classify_regime_for_test(&market, 1.8, 0.06, strat.cfg.min_liquidity_usdc * 1.05);
+        assert_eq!(low, "low_vol|normal_spread|normal_liq|normal_event");
+        assert_eq!(stressed, "high_vol|wide_spread|thin_liq|normal_event");
+    }
+
+    #[test]
+    fn test_regime_classification_adds_event_bucket() {
+        let mut adaptive = AdaptiveConfig::default();
+        adaptive.event_regime_enabled = true;
+        adaptive.event_assets = vec!["BTC".to_string()];
+        let strat = Strategy::new(
+            StrategyConfig::default(),
+            KellyConfig::default(),
+            RiskConfig::default(),
+            adaptive,
+        );
+        let market = mock_market("BTC", "Will BTC be above $50,000?");
+        let label =
+            strat.classify_regime_for_test(&market, 0.9, 0.01, strat.cfg.min_liquidity_usdc * 2.0);
+        assert_eq!(label, "low_vol|normal_spread|normal_liq|event");
     }
 }

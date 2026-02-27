@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
@@ -38,7 +39,10 @@ fn detect_resolution(question: &str) -> Option<u32> {
     let q = question.to_lowercase();
     for &(mins, kws) in &[
         (5u32, ["5-minute", "5 minute", "5min", "5 min"].as_slice()),
-        (15u32, ["15-minute", "15 minute", "15min", "15 min"].as_slice()),
+        (
+            15u32,
+            ["15-minute", "15 minute", "15min", "15 min"].as_slice(),
+        ),
     ] {
         if kws.iter().any(|kw| q.contains(kw)) {
             return Some(mins);
@@ -171,6 +175,12 @@ impl PolymarketClient {
                 .or_else(|| item["end_date_iso"].as_str())
                 .unwrap_or("")
                 .to_string();
+            let resolved = item["resolved"]
+                .as_bool()
+                .or_else(|| item["isResolved"].as_bool())
+                .or_else(|| item["is_resolved"].as_bool())
+                .unwrap_or(false);
+            let resolution_price = parse_resolution_price(item);
 
             markets.push(Market {
                 condition_id: cid.to_string(),
@@ -182,8 +192,8 @@ impl PolymarketClient {
                 end_date_iso: end_date,
                 active: item["active"].as_bool().unwrap_or(true),
                 closed: item["closed"].as_bool().unwrap_or(false),
-                resolved: false,
-                resolution_price: None,
+                resolved,
+                resolution_price,
             });
             *count += 1;
         }
@@ -314,7 +324,10 @@ impl PolymarketClient {
             "condition_id": condition_id,
         });
         if self.dry_run {
-            info!("[DRY RUN] LIMIT {side} {:.8}… @ {price:.4} × {size:.2}", token_id);
+            info!(
+                "[DRY RUN] LIMIT {side} {:.8}… @ {price:.4} × {size:.2}",
+                token_id
+            );
             return Ok(json!({
                 "status": "dry_run",
                 "order_id": format!("dry_{}", Utc::now().timestamp_millis()),
@@ -466,10 +479,10 @@ fn handle_ws_text(
         return;
     }
 
-    let market_id = token_to_market
-        .get(token_id)
-        .cloned()
-        .unwrap_or_else(|| token_id.to_string());
+    let Some(market_id) = token_to_market.get(token_id).cloned() else {
+        debug!("Ignoring update for unknown token: {token_id}");
+        return;
+    };
 
     let book = parse_order_book(&msg, &market_id, token_id);
 
@@ -486,7 +499,13 @@ fn handle_ws_text(
     };
 
     // Non-blocking send (drop if channel full)
-    let _ = tx.try_send(update);
+    match tx.try_send(update) {
+        Ok(_) => {}
+        Err(TrySendError::Full(_)) => {
+            debug!("Dropping WS book update (channel full) for token {token_id:.8}…");
+        }
+        Err(TrySendError::Closed(_)) => {}
+    }
 
     debug!("Order book updated for token {token_id:.8}…");
 }
@@ -502,12 +521,12 @@ fn parse_order_book(data: &Value, market_id: &str, token_id: &str) -> OrderBook 
             .unwrap_or(&vec![])
             .iter()
             .filter_map(|l| {
-                let price = l["price"].as_f64().or_else(|| {
-                    l["price"].as_str().and_then(|s| s.parse::<f64>().ok())
-                })?;
-                let size = l["size"].as_f64().or_else(|| {
-                    l["size"].as_str().and_then(|s| s.parse::<f64>().ok())
-                })?;
+                let price = l["price"]
+                    .as_f64()
+                    .or_else(|| l["price"].as_str().and_then(|s| s.parse::<f64>().ok()))?;
+                let size = l["size"]
+                    .as_f64()
+                    .or_else(|| l["size"].as_str().and_then(|s| s.parse::<f64>().ok()))?;
                 Some(PriceLevel { price, size })
             })
             .collect()
@@ -515,8 +534,16 @@ fn parse_order_book(data: &Value, market_id: &str, token_id: &str) -> OrderBook 
 
     let mut bids = parse_levels("bids");
     let mut asks = parse_levels("asks");
-    bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
-    asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+    bids.sort_by(|a, b| {
+        b.price
+            .partial_cmp(&a.price)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    asks.sort_by(|a, b| {
+        a.price
+            .partial_cmp(&b.price)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     OrderBook {
         market_id: market_id.to_string(),
@@ -553,6 +580,25 @@ fn parse_token_ids(item: &Value) -> (String, String) {
         }
     }
     (String::new(), String::new())
+}
+
+fn parse_resolution_price(item: &Value) -> Option<f64> {
+    for key in [
+        "resolutionPrice",
+        "resolution_price",
+        "finalValue",
+        "final_value",
+    ] {
+        if let Some(v) = item.get(key).and_then(value_as_f64) {
+            return Some(v.clamp(0.0, 1.0));
+        }
+    }
+    None
+}
+
+fn value_as_f64(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
 }
 
 // ---------------------------------------------------------------------------

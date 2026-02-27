@@ -39,7 +39,10 @@ fn make_book(bid: f64, ask: f64, liq_usdc: f64) -> OrderBook {
 fn make_market(resolution_minutes: u32, asset: &str) -> Market {
     Market {
         condition_id: "cond_x".into(),
-        question: format!("Will {} be above $50,000 in {resolution_minutes} minutes?", asset),
+        question: format!(
+            "Will {} be above $50,000 in {resolution_minutes} minutes?",
+            asset
+        ),
         yes_token_id: "yes_x".into(),
         no_token_id: "no_x".into(),
         asset: asset.to_string(),
@@ -58,6 +61,7 @@ fn default_strategy() -> Strategy {
         config::StrategyConfig::default(),
         config::KellyConfig::default(),
         config::RiskConfig::default(),
+        config::AdaptiveConfig::default(),
     )
 }
 
@@ -118,7 +122,10 @@ fn dynamic_price_min_capped_at_30_pct() {
 
 #[test]
 fn extract_threshold_dollar_with_comma() {
-    assert_eq!(extract_threshold("Will BTC be above $50,000?"), Some(50_000.0));
+    assert_eq!(
+        extract_threshold("Will BTC be above $50,000?"),
+        Some(50_000.0)
+    );
 }
 
 #[test]
@@ -128,7 +135,10 @@ fn extract_threshold_dollar_no_comma() {
 
 #[test]
 fn extract_threshold_bare_number() {
-    assert_eq!(extract_threshold("BTC above 50000 at 12:00"), Some(50_000.0));
+    assert_eq!(
+        extract_threshold("BTC above 50000 at 12:00"),
+        Some(50_000.0)
+    );
 }
 
 #[test]
@@ -162,8 +172,14 @@ fn book_imbalance_bid_heavy() {
         market_id: "test".into(),
         token_id: "tok".into(),
         timestamp: Utc::now(),
-        bids: vec![PriceLevel { price: 0.49, size: 5000.0 }], // ~$2450
-        asks: vec![PriceLevel { price: 0.51, size: 100.0 }],   // ~$51
+        bids: vec![PriceLevel {
+            price: 0.49,
+            size: 5000.0,
+        }], // ~$2450
+        asks: vec![PriceLevel {
+            price: 0.51,
+            size: 100.0,
+        }], // ~$51
     };
     let imb = book_imbalance(&book, 0.05);
     assert!(imb > 0.5, "should be bullish: {imb}");
@@ -175,8 +191,14 @@ fn book_imbalance_ask_heavy() {
         market_id: "test".into(),
         token_id: "tok".into(),
         timestamp: Utc::now(),
-        bids: vec![PriceLevel { price: 0.49, size: 100.0 }],
-        asks: vec![PriceLevel { price: 0.51, size: 5000.0 }],
+        bids: vec![PriceLevel {
+            price: 0.49,
+            size: 100.0,
+        }],
+        asks: vec![PriceLevel {
+            price: 0.51,
+            size: 5000.0,
+        }],
     };
     let imb = book_imbalance(&book, 0.05);
     assert!(imb < -0.5, "should be bearish: {imb}");
@@ -278,7 +300,7 @@ fn evaluate_no_signal_below_price_min() {
     strat.btc_spot = 55_000.0; // well above threshold
 
     let market = make_market(5, "BTC"); // threshold ~ 50k
-    // Ask is below price_min (0.02), so even a good NO signal should be skipped
+                                        // Ask is below price_min (0.02), so even a good NO signal should be skipped
     let book = make_book(0.005, 0.010, 1000.0);
     let signal = strat.evaluate(&market, &book, 1000.0, 0, &empty_asset_counts());
     // Very cheap ask below price_min -> should not trade

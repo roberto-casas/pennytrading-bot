@@ -12,10 +12,10 @@ markets:
   max_markets_per_asset: 3       # How many simultaneous markets to watch per asset
 
 strategy:
-  min_edge: 0.04                 # Minimum edge (4 %) before entering a trade
-  min_liquidity_usdc: 500        # Minimum USDC liquidity on best side required
-  max_spread_pct: 0.08           # Maximum acceptable bid-ask spread (8 %)
-  prefer_limit_orders: true      # Use limit orders when possible
+  min_edge: 0.06                 # Minimum edge (6 %) before entering a trade
+  min_liquidity_usdc: 1500       # Minimum USDC liquidity on best side required
+  max_spread_pct: 0.04           # Maximum acceptable bid-ask spread (4 %)
+  prefer_limit_orders: false     # Prefer market orders for fill certainty
   price_min: 0.02                # Do not trade YES/NO contracts below this price
   price_max: 0.98                # Do not trade YES/NO contracts above this price
 
@@ -27,14 +27,63 @@ kelly:
 
 risk:
   stop_loss_pct: 0.50            # Exit position if price drops 50 % from entry
-  take_profit_pct: 2.00          # Exit position if price rises 200 % from entry
-  max_open_positions: 10         # Limit concurrent open positions
+  take_profit_pct: 0.60          # Binary-capped TP baseline (final TP is capped below 1.0)
+  max_open_positions: 6          # Limit concurrent open positions
   time_limit_fraction: 0.75      # Close position if > 75 % of time-to-resolution elapsed
+  max_session_drawdown_usdc: 75  # Pause new entries if drawdown from peak exceeds this USDC
+  max_session_drawdown_pct: 0.12 # Pause new entries if drawdown exceeds this fraction of peak
+  max_asset_sigma: 2.20          # Skip new entries for assets above this annualized sigma
 
 clob:
   rest_url: https://clob.polymarket.com
   ws_url: wss://ws-subscriptions-clob.polymarket.com/ws/
   gamma_url: https://gamma-api.polymarket.com
+
+execution:
+  maker_fee_bps: 0.0             # Estimated maker fee in basis points
+  taker_fee_bps: 2.0             # Estimated taker fee in basis points
+  maker_slippage_bps: 1.0        # Estimated maker slippage in basis points
+  taker_slippage_bps: 8.0        # Estimated taker slippage in basis points
+
+adaptive:
+  enabled: true                  # Enable calibration-driven runtime retuning
+  calibration_interval_cycles: 24 # Evaluate calibration every ~2 minutes at 5s poll
+  sample_window: 200             # Most recent resolved trades used in calibration stats
+  min_resolved_trades: 30        # Minimum resolved trades required to retune
+  brier_margin: 0.01             # Minimum Brier gap to trigger parameter adjustments
+  edge_step: 0.005               # Step size for strategy.min_edge adjustments
+  min_edge_floor: 0.04           # Lower bound for strategy.min_edge when loosening
+  max_edge_cap: 0.15             # Upper bound for strategy.min_edge when tightening
+  kelly_step: 0.02               # Step size for kelly.fraction adjustments
+  min_kelly_fraction: 0.10       # Lower bound for kelly.fraction when tightening
+  max_kelly_fraction: 0.35       # Upper bound for kelly.fraction when loosening
+  regime_enabled: true           # Tune low/high volatility regimes independently
+  regime_sigma_threshold: 1.40   # Sigma cutoff between low_vol and high_vol buckets
+  regime_wide_spread_pct: 0.025  # Spread% cutoff for wide_spread regime flag
+  regime_thin_liquidity_mult: 1.50 # Liquidity multiple cutoff for thin_liq flag
+  event_regime_enabled: false    # Enable event/news-aware regime tagging
+  global_event_active: false     # Force all markets into event regime
+  event_assets: []               # Example: [BTC, ETH] while event risk is active
+  event_keywords: [fomc, cpi, sec, etf] # Question keywords for event tagging
+  external_feed_enabled: false   # Poll external feeds to auto-tag event regimes
+  external_feed_urls:
+    - https://www.coindesk.com/arc/outboundfeeds/rss/
+    - https://www.theblock.co/rss.xml
+  external_feed_poll_seconds: 90 # Seconds between feed polls
+  external_feed_timeout_seconds: 8 # HTTP timeout per feed request
+  external_event_cooldown_minutes: 30 # Keep event active after feed hit
+  external_event_min_score: 1.0 # Minimum aggregate source score to activate event state
+  external_dedup_window_minutes: 20 # Minutes to suppress duplicate payload fingerprints
+  external_asset_keywords:       # Asset keyword map used for feed payload matching
+    BTC: [bitcoin, btc, spot btc, bitcoin etf]
+    ETH: [ethereum, eth, ether, spot eth]
+  external_source_weights:       # Optional source confidence weights by hostname/URL
+    coindesk.com: 1.0
+    theblock.co: 1.0
+  external_reliability_enabled: true # Adapt source trust based on cross-source confirmation
+  external_reliability_alpha: 0.20 # EMA smoothing for source reliability updates
+  external_reliability_min_mult: 0.50 # Min dynamic multiplier applied to source weights
+  external_reliability_max_mult: 1.50 # Max dynamic multiplier applied to source weights
 
 dashboard:
   refresh_rate: 1.0              # Seconds between live dashboard refreshes

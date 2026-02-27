@@ -23,8 +23,7 @@ fn erf(x: f64) -> f64 {
     let poly = t
         * (0.254_829_592
             + t * (-0.284_496_736
-                + t * (1.421_413_741
-                    + t * (-1.453_152_027 + t * 1.061_405_429))));
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
     let result = 1.0 - poly * (-x * x).exp();
     sign * result
 }
@@ -93,7 +92,9 @@ pub fn compute_bet(
     let bet = if raw_bet < min_bet_usdc {
         0.0
     } else {
-        raw_bet.min(max_bet_usdc).min(max_position_pct * bankroll_usdc)
+        raw_bet
+            .min(max_bet_usdc)
+            .min(max_position_pct * bankroll_usdc)
     };
 
     BetResult {

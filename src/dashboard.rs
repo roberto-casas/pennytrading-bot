@@ -111,9 +111,17 @@ pub fn render(frame: &mut Frame, state: &AppState) {
 
 fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
     let mode = if state.dry_run {
-        Span::styled(" [DRY RUN] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        Span::styled(
+            " [DRY RUN] ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
-        Span::styled(" [LIVE] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        Span::styled(
+            " [LIVE] ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
     };
 
     let ws_status = if state.ws_connected {
@@ -139,7 +147,9 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
     let line = Line::from(vec![
         Span::styled(
             "  🪙 PennyTrading Bot  │ ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!("Up: {}  │ ", uptime)),
         Span::raw(format!("Balance: ${:.2}  │ ", state.balance_usdc)),
@@ -158,8 +168,11 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState) {
         Span::styled("  [q] quit", Style::default().fg(Color::DarkGray)),
     ]);
 
-    let header = Paragraph::new(line)
-        .block(Block::default().borders(Borders::ALL).title(" PennyTrading Bot "));
+    let header = Paragraph::new(line).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" PennyTrading Bot "),
+    );
     frame.render_widget(header, area);
 }
 
@@ -186,7 +199,11 @@ fn render_positions(frame: &mut Frame, area: Rect, state: &AppState) {
                 .and_then(|b| b.best_bid())
                 .unwrap_or(pos.entry_price);
             let upnl = pos.unrealised_pnl(current_price);
-            let upnl_color = if upnl >= 0.0 { Color::Green } else { Color::Red };
+            let upnl_color = if upnl >= 0.0 {
+                Color::Green
+            } else {
+                Color::Red
+            };
 
             let label = format!(
                 "{}-{}m",
@@ -206,8 +223,10 @@ fn render_positions(frame: &mut Frame, area: Rect, state: &AppState) {
                 })),
                 Cell::from(format!("{:.4}", pos.entry_price)),
                 Cell::from(format!("{:.2}", pos.size)),
-                Cell::from(format!("{:.4}", pos.stop_loss_price)).style(Style::default().fg(Color::Red)),
-                Cell::from(format!("{:.4}", pos.take_profit_price)).style(Style::default().fg(Color::Green)),
+                Cell::from(format!("{:.4}", pos.stop_loss_price))
+                    .style(Style::default().fg(Color::Red)),
+                Cell::from(format!("{:.4}", pos.take_profit_price))
+                    .style(Style::default().fg(Color::Green)),
                 Cell::from(format!("{:+.2}", upnl))
                     .style(Style::default().fg(upnl_color).add_modifier(Modifier::BOLD)),
             ])
@@ -281,11 +300,14 @@ fn render_trades(frame: &mut Frame, area: Rect, state: &AppState) {
                 Cell::from(label),
                 Cell::from(pos.side.as_str()),
                 Cell::from(format!("{:.4}", pos.entry_price)),
-                Cell::from(pos.exit_price.map(|p| format!("{:.4}", p)).unwrap_or_else(|| "—".into())),
+                Cell::from(
+                    pos.exit_price
+                        .map(|p| format!("{:.4}", p))
+                        .unwrap_or_else(|| "—".into()),
+                ),
                 Cell::from(format!("{:+.2}", pnl))
                     .style(Style::default().fg(pnl_color).add_modifier(Modifier::BOLD)),
-                Cell::from(pos.status.as_str())
-                    .style(Style::default().fg(status_color)),
+                Cell::from(pos.status.as_str()).style(Style::default().fg(status_color)),
             ])
         })
         .collect();
@@ -338,11 +360,23 @@ fn render_markets(frame: &mut Frame, area: Rect, state: &AppState) {
                 rows.push(Row::new(vec![
                     Cell::from(label),
                     Cell::from(format!("{:.8}…", &token_id[..token_id.len().min(8)])),
-                    Cell::from(book.best_bid().map(|p| format!("{:.4}", p)).unwrap_or_else(|| "—".into()))
-                        .style(Style::default().fg(Color::Green)),
-                    Cell::from(book.best_ask().map(|p| format!("{:.4}", p)).unwrap_or_else(|| "—".into()))
-                        .style(Style::default().fg(Color::Red)),
-                    Cell::from(book.mid_price().map(|p| format!("{:.4}", p)).unwrap_or_else(|| "—".into())),
+                    Cell::from(
+                        book.best_bid()
+                            .map(|p| format!("{:.4}", p))
+                            .unwrap_or_else(|| "—".into()),
+                    )
+                    .style(Style::default().fg(Color::Green)),
+                    Cell::from(
+                        book.best_ask()
+                            .map(|p| format!("{:.4}", p))
+                            .unwrap_or_else(|| "—".into()),
+                    )
+                    .style(Style::default().fg(Color::Red)),
+                    Cell::from(
+                        book.mid_price()
+                            .map(|p| format!("{:.4}", p))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
                     Cell::from(format!("${:.0}", liq)),
                 ]));
             } else {
@@ -393,12 +427,16 @@ fn render_logs(frame: &mut Frame, area: Rect, state: &AppState) {
                 Color::Red
             } else if line.contains("DRY") {
                 Color::Yellow
-            } else if line.contains("Opened") || line.contains("CLOSED_TP") || line.contains("WIN") {
+            } else if line.contains("Opened") || line.contains("CLOSED_TP") || line.contains("WIN")
+            {
                 Color::Green
             } else {
                 Color::Gray
             };
-            ListItem::new(Line::from(Span::styled(line.clone(), Style::default().fg(color))))
+            ListItem::new(Line::from(Span::styled(
+                line.clone(),
+                Style::default().fg(color),
+            )))
         })
         .collect();
 

@@ -22,7 +22,10 @@ mod database;
 mod kelly;
 
 use database::Database;
-use models::{BotSession, Market, OrderBook, PriceLevel, Position, Side, TradeStatus, OrderType};
+use models::{
+    BotSession, Market, OrderBook, OrderType, Position, PriceLevel, Side, TradeDiagnostics,
+    TradeStatus,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -83,6 +86,29 @@ fn sample_session(id: &str) -> BotSession {
         trades_closed: 0,
         total_pnl_usdc: 0.0,
         config_snapshot: "{}".into(),
+    }
+}
+
+fn sample_diag(
+    position_id: &str,
+    edge: f64,
+    model_prob: f64,
+    market_prob: f64,
+    regime: &str,
+) -> TradeDiagnostics {
+    TradeDiagnostics {
+        position_id: position_id.to_string(),
+        session_id: "sess_diag".into(),
+        market_id: "cond_diag".into(),
+        asset: "BTC".into(),
+        side: Side::YES,
+        model_prob,
+        market_prob,
+        edge,
+        regime: regime.to_string(),
+        entry_price: market_prob,
+        bet_usdc: 50.0,
+        created_at: Utc::now(),
     }
 }
 
@@ -154,7 +180,8 @@ fn test_upsert_and_get_position() {
     db.upsert_session(&s).expect("upsert session");
 
     let pos = sample_position("cond_10");
-    db.upsert_position(&pos, Some("sess_1")).expect("upsert position");
+    db.upsert_position(&pos, Some("sess_1"))
+        .expect("upsert position");
 
     let positions = db.get_open_positions().expect("get open");
     assert_eq!(positions.len(), 1);
@@ -246,8 +273,14 @@ fn test_orderbook_snapshot_saved() {
         market_id: "cond_40".into(),
         token_id: "yes_40".into(),
         timestamp: Utc::now(),
-        bids: vec![PriceLevel { price: 0.49, size: 100.0 }],
-        asks: vec![PriceLevel { price: 0.51, size: 100.0 }],
+        bids: vec![PriceLevel {
+            price: 0.49,
+            size: 100.0,
+        }],
+        asks: vec![PriceLevel {
+            price: 0.51,
+            size: 100.0,
+        }],
     };
 
     db.save_orderbook_snapshot(&book).expect("save snapshot");
@@ -269,4 +302,106 @@ fn test_dry_run_position_in_open() {
     // DRY_RUN status should count as open
     let open = db.get_open_positions().expect("get open");
     assert_eq!(open.len(), 1);
+}
+
+#[test]
+fn test_calibration_stats_uses_resolved_positions() {
+    let (_f, db) = tmp_db();
+    let market = sample_market(60);
+    db.upsert_market(&market).expect("upsert market");
+    let session = sample_session("sess_diag");
+    db.upsert_session(&session).expect("upsert session");
+
+    let mut win = sample_position("cond_60");
+    win.position_id = "pos_win".into();
+    win.status = TradeStatus::ResolvedWin;
+    win.closed_at = Some(Utc::now());
+    win.pnl_usdc = Some(10.0);
+    db.upsert_position(&win, Some("sess_diag"))
+        .expect("upsert win");
+    db.upsert_trade_diagnostics(&sample_diag(
+        "pos_win",
+        0.15,
+        0.70,
+        0.55,
+        "low_vol|normal_spread|normal_liq|normal_event",
+    ))
+    .expect("diag win");
+
+    let mut loss = sample_position("cond_60");
+    loss.position_id = "pos_loss".into();
+    loss.status = TradeStatus::ResolvedLoss;
+    loss.closed_at = Some(Utc::now());
+    loss.pnl_usdc = Some(-10.0);
+    db.upsert_position(&loss, Some("sess_diag"))
+        .expect("upsert loss");
+    db.upsert_trade_diagnostics(&sample_diag(
+        "pos_loss",
+        -0.15,
+        0.30,
+        0.45,
+        "high_vol|wide_spread|thin_liq|event",
+    ))
+    .expect("diag loss");
+
+    let stats = db
+        .calibration_stats(100)
+        .expect("calibration stats")
+        .expect("non-empty");
+    assert_eq!(stats.sample_size, 2);
+    assert!((stats.model_brier - 0.09).abs() < 1e-9);
+    assert!((stats.market_brier - 0.2025).abs() < 1e-9);
+    assert!((stats.avg_edge - 0.0).abs() < 1e-9);
+    assert!((stats.model_edge_hit_rate - 0.5).abs() < 1e-9);
+
+    let low = db
+        .calibration_stats_for_regime(100, "low_vol|normal_spread|normal_liq|normal_event")
+        .expect("low regime stats")
+        .expect("low non-empty");
+    assert_eq!(low.sample_size, 1);
+    assert!((low.model_brier - 0.09).abs() < 1e-9);
+
+    let regimes = db.calibration_regimes(10).expect("regime list");
+    assert!(regimes
+        .iter()
+        .any(|r| r == "low_vol|normal_spread|normal_liq|normal_event"));
+    assert!(regimes
+        .iter()
+        .any(|r| r == "high_vol|wide_spread|thin_liq|event"));
+}
+
+#[test]
+fn test_resolved_trade_samples_returns_recent_chronological() {
+    let (_f, db) = tmp_db();
+    let market = sample_market(61);
+    db.upsert_market(&market).expect("upsert market");
+    let session = sample_session("sess_samples");
+    db.upsert_session(&session).expect("upsert session");
+
+    for i in 0..3 {
+        let mut pos = sample_position("cond_61");
+        pos.position_id = format!("pos_sample_{i}");
+        pos.status = if i % 2 == 0 {
+            TradeStatus::ResolvedWin
+        } else {
+            TradeStatus::ResolvedLoss
+        };
+        pos.closed_at = Some(Utc::now() + chrono::Duration::seconds(i as i64));
+        pos.pnl_usdc = Some(if i % 2 == 0 { 5.0 } else { -4.0 });
+        db.upsert_position(&pos, Some("sess_samples"))
+            .expect("upsert position");
+
+        db.upsert_trade_diagnostics(&sample_diag(
+            &pos.position_id,
+            0.05 + i as f64 * 0.01,
+            0.60,
+            0.52,
+            "low_vol|normal_spread|normal_liq|normal_event",
+        ))
+        .expect("upsert diag");
+    }
+
+    let samples = db.resolved_trade_samples(2).expect("resolved samples");
+    assert_eq!(samples.len(), 2);
+    assert!(samples[0].closed_at <= samples[1].closed_at);
 }
