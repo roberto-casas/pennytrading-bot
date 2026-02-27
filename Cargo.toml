@@ -1,6 +1,6 @@
 [package]
 name = "pennytrading-bot"
-version = "0.3"
+version = "0.3.0"
 edition = "2021"
 description = "Polymarket penny strategy trading bot – WebSocket data feed, SQLite persistence, ratatui dashboard"
 
